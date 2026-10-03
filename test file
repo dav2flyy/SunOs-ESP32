@@ -1,0 +1,132 @@
+import unittest
+from dataclasses import replace
+
+import sunos_model as m
+
+class LegacyRegression(unittest.TestCase):
+    def test_home_customer(self):
+        p = m.legacy_params()
+        r = m.customer_roi(p, p.home)
+        self.assertAlmostEqual(r["benefit_y1"], 167.2, delta=0.1)
+        self.assertAlmostEqual(r["roi"][1], 1.09, delta=0.005)
+        self.assertAlmostEqual(r["roi"][3], 2.136, delta=0.005)
+        self.assertAlmostEqual(r["roi"][5], 2.483, delta=0.005)
+        self.assertAlmostEqual(r["payback_simple_months"], 5.74, delta=0.05)
+
+    def test_sme_customer(self):
+        p = m.legacy_params()
+        r = m.customer_roi(p, p.sme)
+        self.assertAlmostEqual(r["benefit_y1"], 1168.8, delta=0.5)
+        self.assertEqual(r["cost"][1], 700)
+        self.assertAlmostEqual(r["roi"][1], 0.670, delta=0.005)
+        self.assertAlmostEqual(r["roi"][3], 1.338, delta=0.005)
+        self.assertAlmostEqual(r["roi"][5], 1.541, delta=0.005)
+
+    def test_company_with_salaries(self):
+        rows = m.company_model(m.legacy_params(True))["rows"]
+        expect = [-36730, -85000, -129100, -133800, -67800]
+        for r, e in zip(rows, expect):
+            self.assertAlmostEqual(r["cum_net"], e, delta=1)
+        self.assertAlmostEqual(rows[-1]["revenue"], 490000, delta=1)
+
+    def test_company_no_salaries(self):
+        rows = m.company_model(m.legacy_params(False))["rows"]
+        expect = [270, 16000, 71900, 203200, 441200]
+        for r, e in zip(rows, expect):
+            self.assertAlmostEqual(r["cum_net"], e, delta=1)
+
+    def test_market_and_impact(self):
+        p = m.legacy_params()
+        self.assertAlmostEqual(m.market(p)["recurring_top_down"], 2.6e6, delta=1)
+        self.assertAlmostEqual(m.impact(p, 5000, 700)["gwh"], 9.3, delta=0.01)
+
+class Structure(unittest.TestCase):
+    def setUp(self):
+        self.p = m.Params()
+
+    def test_month_share_sums_to_one(self):
+        self.assertAlmostEqual(sum(self.p.month_share), 1.0, places=9)
+
+    def test_market_capacity_consistent(self):
+        self.assertAlmostEqual(m.market(self.p)["capacity_check_mw"], self.p.installed_mw, delta=0.5)
+
+    def test_sme_one_off_consistent(self):
+        # customer pays 240 hardware + 60 installer fee; company books only the 240
+        self.assertEqual(m.hw_oneoff_usd(self.p.sme), 300)
+        r = m.company_model(replace(self.p, end_home=(0,), end_sme=(10,), fte_years=(0,), overhead=(0,)))["rows"][0]
+        self.assertEqual(r["hardware"], 10 * 240)
+
+    def test_shifting_gain_derived_from_assumptions(self):
+        self.assertAlmostEqual(m.shifting_gain_amd(replace(self.p, tariff_day=45)), 18.0, places=9)
+
+    def test_single_fx_changes_every_layer(self):
+        a = m.customer_roi(self.p, self.p.home)["benefit_y1"]
+        b = m.customer_roi(replace(self.p, fx=self.p.fx * 2), self.p.home)["benefit_y1"]
+        self.assertAlmostEqual(b, a / 2, places=6)
+
+    def test_seasonal_payback_depends_on_start_month(self):
+        best, worst = m.customer_roi(self.p, self.p.home)["payback_best_worst"]
+        self.assertLess(best, worst)
+
+    def test_degradation_reduces_later_benefit(self):
+        y1 = m.benefit_parts(self.p, self.p.home, 1)["total"]
+        y5 = m.benefit_parts(self.p, self.p.home, 5)["total"]
+        self.assertAlmostEqual(y5 / y1, (1 - self.p.degradation) ** 4, places=6)
+
+    def test_battery_off_by_default_and_adds_value_when_on(self):
+        base = m.benefit_parts(self.p, self.p.home, 1)
+        self.assertEqual(base["battery"], 0.0)
+        on = m.benefit_parts(replace(self.p, battery_kwh=5), self.p.home, 1)
+        self.assertGreater(on["battery"], 0.0)
+        # value uses round-trip efficiency: with RTE <= export_fraction there is no value
+        none = m.benefit_parts(replace(self.p, battery_kwh=5, battery_rte=0.5), self.p.home, 1)
+        self.assertEqual(none["battery"], 0.0)
+
+    def test_night_shift_uses_tariff_split(self):
+        seg = replace(self.p.home, night_shifted_kwh=1000)
+        got = m.benefit_parts(self.p, seg, 1)["night"]
+        self.assertAlmostEqual(got, 1000 * (44.98 - 34.98) / self.p.fx, places=6)
+
+    def test_salary_switch(self):
+        a = m.company_model(replace(self.p, include_salaries=True))["rows"]
+        b = m.company_model(replace(self.p, include_salaries=False))["rows"]
+        for x, y in zip(a, b):
+            self.assertGreater(x["costs"], y["costs"])
+            self.assertEqual(x["revenue"], y["revenue"])
+        self.assertAlmostEqual(a[0]["salaries"], 1.5 * 12 * 1800, places=6)
+
+    def test_scenarios_are_ordered(self):
+        s = m.scenarios(self.p)
+        n = {k: m.company_model(v)["rows"][-1]["cum_net"] for k, v in s.items()}
+        self.assertLess(n["worst"], n["base"])
+        self.assertLess(n["base"], n["best"])
+
+    def test_breakeven_recovery_gives_zero_roi(self):
+        for seg in (self.p.home, self.p.sme):
+            x = m.breakeven_loss_recovered(self.p, seg, years=3)
+            r = m.customer_roi(replace(self.p, loss_recovered=x), seg, monitoring_only=True)
+            self.assertAlmostEqual(r["roi"][3], 0.0, places=6)
+
+    def test_tornado_sorted_and_directional(self):
+        t = m.tornado(self.p, m.metric_home_roi3)
+        swings = [r[3] for r in t]
+        self.assertEqual(swings, sorted(swings, reverse=True))
+        d = {r[0]: r for r in t}
+        self.assertGreater(d["loss_recovered"][2], d["loss_recovered"][1])       
+        self.assertLess(d["export_fraction"][2], d["export_fraction"][1])        
+
+class PilotDesign(unittest.TestCase):
+    def test_margin_shrinks_with_n(self):
+        self.assertGreater(m.margin_of_error(10, 0.04), m.margin_of_error(30, 0.04))
+
+    def test_sites_for_margin_matches_margin_of_error(self):
+        n = m.sites_for_margin(0.04, 0.015)
+        self.assertLessEqual(m.margin_of_error(n, 0.04), 0.015)
+        self.assertGreater(m.margin_of_error(n - 1, 0.04), 0.015)
+        self.assertEqual(n, 30)
+
+    def test_detection_sample_size(self):
+        self.assertEqual(m.sites_for_detection(0.026, 0.04), 15)
+
+if __name__ == "__main__":
+    unittest.main()
