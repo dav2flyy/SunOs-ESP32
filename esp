@@ -1,0 +1,588 @@
+"""ESP32 CODE"""
+from __future__ import annotations
+import math
+import statistics
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Sequence, Tuple
+
+FLAG_NAMES = {0x01: "ina219_fail", 0x02: "bh1750_fail", 0x04: "temp_fail", 0x08: "lux_saturated",
+              0x10: "voltage_out_of_range", 0x20: "current_out_of_range", 0x40: "time_unsynced",
+              0x80: "relay_failsafe"}
+INVALIDATING = 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20
+
+
+@dataclass(frozen=True)
+class SiteConfig:
+    """panel""" 
+    p_rated_w: float = 20.0
+    v_mp: float = 18.0
+    v_oc: float = 22.0
+    gamma_p: float = -0.004            
+    cell_dt_at_1000: float = 3.0       
+    """irradiance(BH1750)"""
+    lux_per_wm2: float = 120.0         
+    k_cal: float = 1.0                 
+    g_min: float = 200.0               
+    """sensor limits (INA219 bus <= 26 V, shunt 0.1 ohm -> ~3.2 A)"""
+    v_max: float = 26.0
+    i_max: float = 3.2
+    lux_saturation: float = 120000.0
+    temp_min: float = -40.0
+    temp_max: float = 100.0
+    """tariffs / time"""
+    tariff_day: float = 44.98
+    tariff_night: float = 34.98
+    day_start_h: int = 7              
+    night_start_h: int = 23
+    export_fraction: float = 0.60      
+    utc_offset_h: int = 4              
+    """presentation / economics"""
+    site_scale: float = 1.0            
+    peak_sun_hours: float = 5.0        
+    cleaning_cost_amd: float = 10000.0 
+    emission_factor_t_per_mwh: float = 0.436
+
+
+@dataclass(frozen=True)
+class Thresholds:
+    ok_pr: float = 0.92
+    warn_pr: float = 0.85
+    no_current_ratio: float = 0.05     
+    strong_light: float = 400.0
+    v_drop_frac: float = 0.25          
+    i_stable_frac: float = 0.12        
+    similar_light_frac: float = 0.20
+    shading_rel: float = 0.85          
+    shading_min_days: int = 3
+    shading_days_lookback: int = 7
+    soiling_min_days: int = 4
+    soiling_slope: float = -0.003     
+    soiling_drop: float = 0.03
+    soiling_flat_std: float = 0.05
+    reset_jump: float = 0.03           
+    heat_t_cell: float = 55.0
+    heat_gap: float = 0.05
+    clean_horizon_days: float = 30.0
+
+
+def local_dt(ts: float, cfg: SiteConfig) -> datetime:
+    return datetime.fromtimestamp(ts, tz=timezone(timedelta(hours=cfg.utc_offset_h)))
+
+
+def is_day(ts: float, cfg: SiteConfig) -> bool:
+    return cfg.day_start_h <= local_dt(ts, cfg).hour < cfg.night_start_h
+
+
+def tariff_at(ts: float, cfg: SiteConfig) -> float:
+    return cfg.tariff_day if is_day(ts, cfg) else cfg.tariff_night
+
+
+def export_price(cfg: SiteConfig) -> float:
+    return cfg.export_fraction * cfg.tariff_day
+
+
+def slot_of(ts: float, cfg: SiteConfig) -> int:
+    d = local_dt(ts, cfg)
+    return (d.hour * 60 + d.minute) // 15 * 15
+
+"""physics"""
+
+def lux_to_irradiance(lux: float, cfg: SiteConfig) -> float:
+    return max(0.0, lux / cfg.lux_per_wm2)
+
+
+def cell_temperature(t_back: float, g: float, cfg: SiteConfig) -> float:
+    return t_back + cfg.cell_dt_at_1000 * g / 1000.0
+
+
+def expected_power(g: float, t_cell: float, cfg: SiteConfig) -> float:
+    return max(0.0, cfg.p_rated_w * (g / 1000.0) * (1.0 + cfg.gamma_p * (t_cell - 25.0)) * cfg.k_cal)
+
+
+def performance_ratio(p: float, g: float, t_cell: float, cfg: SiteConfig) -> Optional[float]:
+    if g < cfg.g_min:
+        return None
+    pe = expected_power(g, t_cell, cfg)
+    return p / pe if pe > 0 else None
+
+
+def cleaning_breakeven_days(cost_amd: float, lost_kwh_per_day: float, tariff: float) -> Optional[float]:
+    """Days until a cleaning pays for itself: cost / (daily lost kWh * tariff)."""
+    daily = lost_kwh_per_day * tariff
+    return cost_amd / daily if daily > 0 else None
+
+
+
+"""samples and sensor error handling"""
+
+@dataclass
+class Sample:
+    ts: float
+    v: float = math.nan
+    i: float = math.nan
+    p: float = 0.0
+    temp_c: float = math.nan
+    lux: float = math.nan
+    g: float = 0.0
+    t_cell: float = math.nan
+    p_exp: float = 0.0
+    pr: Optional[float] = None
+    valid: bool = False
+    flags: int = 0
+    problems: Tuple[str, ...] = ()
+
+
+def _num(x) -> Optional[float]:
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def make_sample(raw: dict, cfg: SiteConfig, ts: Optional[float] = None) -> Sample:
+    s = Sample(ts=float(raw.get("ts") or ts or 0.0))
+    s.flags = int(raw.get("flags") or 0)
+    problems = [name for bit, name in FLAG_NAMES.items() if s.flags & bit]
+    v, i, temp, lux = (_num(raw.get(k)) for k in ("v", "i", "temp_c", "lux"))
+    for name, val in (("v", v), ("i", i), ("temp_c", temp), ("lux", lux)):
+        if val is None:
+            problems.append(f"{name}_missing")
+    if v is not None and not (-0.2 <= v <= cfg.v_max):
+        problems.append("voltage_out_of_range")
+    if i is not None and not (-0.05 <= i <= cfg.i_max):
+        problems.append("current_out_of_range")
+    if temp is not None and (temp <= -126 or temp == 85.0 or not (cfg.temp_min <= temp <= cfg.temp_max)):
+        problems.append("temp_implausible")      # -127 = disconnected probe, 85.0 = DS18B20 power-on value
+    if lux is not None and not (0 <= lux < cfg.lux_saturation):
+        problems.append("lux_out_of_range")
+    s.problems = tuple(dict.fromkeys(problems))
+    s.valid = not any(p for p in s.problems if p not in ("time_unsynced", "relay_failsafe"))
+    if v is not None:
+        s.v = v
+    if i is not None:
+        s.i = i
+    if temp is not None:
+        s.temp_c = temp
+    if lux is not None:
+        s.lux = lux
+    if s.valid:
+        s.p = max(0.0, v * i)
+        s.g = lux_to_irradiance(lux, cfg)
+        s.t_cell = cell_temperature(temp, s.g, cfg)
+        s.p_exp = expected_power(s.g, s.t_cell, cfg)
+        s.pr = performance_ratio(s.p, s.g, s.t_cell, cfg)
+    return s
+
+
+def calibrate_k(samples: Sequence[Sample], cfg: SiteConfig, g_min_cal: float = 600.0, min_samples: int = 30) -> float:
+    ratios = []
+    for s in samples:
+        if s.valid and s.g >= g_min_cal:
+            pe = cfg.p_rated_w * (s.g / 1000.0) * (1.0 + cfg.gamma_p * (s.t_cell - 25.0))
+            if pe > 0:
+                ratios.append(s.p / pe)
+    if len(ratios) < min_samples:
+        raise ValueError(f"need >= {min_samples} clear-sky samples (G>={g_min_cal}), got {len(ratios)}")
+    return statistics.median(ratios)
+
+
+
+"""daily summaries"""
+
+@dataclass
+class DaySummary:
+    date: str
+    energy_wh: float
+    expected_wh: float
+    pr_day: Optional[float]
+    slots: Dict[int, float] = field(default_factory=dict)       # 15-min slot -> mean PR
+    slots_rel: Dict[int, float] = field(default_factory=dict)   # slot PR / pr_day
+
+
+def summarize_day(samples: Sequence[Sample], cfg: SiteConfig, max_dt: float = 120.0) -> DaySummary:
+    good = [s for s in samples if s.valid]
+    date = local_dt(samples[0].ts, cfg).strftime("%Y-%m-%d") if samples else ""
+    e = x = 0.0
+    bins: Dict[int, List[float]] = {}
+    for a, b in zip(good, good[1:] + [None]):
+        dt = min(max_dt, (b.ts - a.ts) if b else (statistics.median([y.ts - z.ts for z, y in zip(good, good[1:])]) if len(good) > 1 else 60.0))
+        if a.g >= cfg.g_min:
+            e += a.p * dt / 3600.0
+            x += a.p_exp * dt / 3600.0
+            if a.pr is not None:
+                bins.setdefault(slot_of(a.ts, cfg), []).append(a.pr)
+    pr_day = e / x if x > 0 else None
+    slots = {k: statistics.fmean(v) for k, v in bins.items()}
+    rel = {k: v / pr_day for k, v in slots.items()} if pr_day else {}
+    return DaySummary(date, e, x, pr_day, slots, rel)
+
+
+def detect_fix(history: Sequence[DaySummary], th: Thresholds = Thresholds()) -> bool:
+    h = [d.pr_day for d in history if d.pr_day]
+    if len(h) < 3:
+        return False
+    return (h[-1] - h[-2] >= th.reset_jump) and (max(h[:-1]) - h[-2] >= 0.02)
+
+
+def reference_pr(history: Sequence[DaySummary], today: Sequence[Sample]) -> Optional[float]:
+    vals = [s.pr for s in today if s.valid and s.pr is not None]
+    if len(vals) >= 10:
+        return statistics.median(vals)
+    h = [d.pr_day for d in history if d.pr_day]
+    return h[-1] if h else None
+
+diagnosis
+
+RECOMMENDATIONS = {
+    "sensor_fault": "Check the sensor wiring/power; readings from the faulty sensor are being ignored.",
+    "no_current": "Inspect the breaker, connectors and inverter: almost no current despite strong sunlight.",
+    "open_circuit": "The panel looks disconnected (voltage high, current ~0): check the load, fuse and connectors.",
+    "bypass_diode": "Voltage dropped by about a third at steady current: likely a failed bypass diode or damaged cell string. Inspect or replace the panel.",
+    "shading_recurring": "Output dips at the same time every day: look for a tree, chimney or building shading the panels at that hour.",
+    "shading_transient": "A short dip. It will be flagged as shading if it repeats at the same time on 3 days.",
+    "soiling": "Gradual loss that is flat across the day: dust/dirt. Clean the panels (the break-even estimate is in the evidence).",
+    "soiling_cleared": "Output recovered after a decline: cleaning or rain. Savings from the fix are booked in the ledger.",
+    "heat_derating": "Output drops only when the panel is very hot: improve ventilation behind the panels if it is a roof-mounted system.",
+    "unexplained": "Underperforming without a clear cause: compare with a reference day and inspect the array.",
+}
+SEVERITY_ORDER = {"INFO": 0, "WARNING": 1, "FAULT": 2}
+
+
+@dataclass
+class Finding:
+    code: str
+    severity: str
+    title: str
+    evidence: Dict[str, float] = field(default_factory=dict)
+    action: str = ""
+    loss_fraction: float = 0.0
+    loss_amd_per_day: float = 0.0
+
+
+@dataclass
+class Diagnosis:
+    status: str
+    findings: List[Finding]
+    pr_window: Optional[float] = None
+    g_mean: float = 0.0
+    t_cell_mean: float = math.nan
+
+    def to_dict(self) -> dict:
+        return dict(status=self.status, pr_window=self.pr_window, g_mean=round(self.g_mean, 1),
+                    findings=[dict(code=f.code, severity=f.severity, title=f.title, action=f.action,
+                                   loss_fraction=round(f.loss_fraction, 4), loss_amd_per_day=round(f.loss_amd_per_day, 1),
+                                   evidence={k: (round(v, 4) if isinstance(v, float) else v) for k, v in f.evidence.items()})
+                              for f in self.findings])
+
+
+def _lstsq_slope(ys: Sequence[float]) -> float:
+    n = len(ys)
+    xm, ym = (n - 1) / 2.0, statistics.fmean(ys)
+    den = sum((x - xm) ** 2 for x in range(n))
+    return sum((x - xm) * (y - ym) for x, y in enumerate(ys)) / den if den else 0.0
+
+
+def _daily_expected_kwh(history: Sequence[DaySummary], cfg: SiteConfig) -> float:
+    recent = [d.expected_wh for d in history[-3:] if d.expected_wh > 0]
+    wh = statistics.fmean(recent) if recent else cfg.p_rated_w * cfg.peak_sun_hours
+    return wh / 1000.0 * cfg.site_scale
+
+
+def diagnose(window: Sequence[Sample], prev_window: Sequence[Sample] = (), history: Sequence[DaySummary] = (),
+             cfg: SiteConfig = SiteConfig(), th: Thresholds = Thresholds(),
+             pr_ref: Optional[float] = None) -> Diagnosis:
+    findings: List[Finding] = []
+
+    def add(code, sev, title, ev, loss=0.0):
+        daily = _daily_expected_kwh(history, cfg)
+        findings.append(Finding(code, sev, title, ev, RECOMMENDATIONS[code], loss, loss * daily * cfg.tariff_day))
+
+    good = [s for s in window if s.valid]
+    if not good:
+        probs = sorted({p for s in window for p in s.problems})
+        add("sensor_fault", "WARNING", "Sensor data invalid", {"bad_samples": float(len(window))})
+        findings[-1].evidence = {"bad_samples": float(len(window))}
+        f = Diagnosis("SENSOR", findings)
+        f.findings[0].title = "Sensor data invalid: " + ", ".join(probs or ["no data"])
+        return f
+    if len(good) < len(window) / 2:
+        add("sensor_fault", "WARNING", "Over half of the readings are invalid", {"bad_samples": float(len(window) - len(good))})
+
+    g_mean = statistics.fmean(s.g for s in good)
+    t_cell = statistics.fmean(s.t_cell for s in good)
+    lit = [s for s in good if s.g >= cfg.g_min]
+    if not lit:
+        return Diagnosis("IDLE" if not findings else "SENSOR", findings, None, g_mean, t_cell)
+
+    pr_win = sum(s.p for s in lit) / max(1e-9, sum(s.p_exp for s in lit))
+    v_mean, i_mean = statistics.fmean(s.v for s in lit), statistics.fmean(s.i for s in lit)
+    p_exp_mean = statistics.fmean(s.p_exp for s in lit)
+    loss = max(0.0, 1.0 - pr_win)
+
+    i_exp = p_exp_mean / max(cfg.v_mp, 1e-6)
+    if g_mean >= th.strong_light and i_mean < th.no_current_ratio * i_exp:
+        code = "open_circuit" if v_mean >= 0.9 * cfg.v_oc else "no_current"
+        add(code, "FAULT", "No current in strong sunlight", {"i_a": i_mean, "i_expected_a": i_exp, "v": v_mean}, loss=1.0)
+    else:
+        # 2) voltage step at steady current and similar light
+        pw = [s for s in prev_window if s.valid and s.g >= cfg.g_min]
+        if pw:
+            gp, vp, ip = (statistics.fmean(getattr(s, k) for s in pw) for k in ("g", "v", "i"))
+            if (gp > 0 and abs(g_mean - gp) / gp <= th.similar_light_frac and vp > 0 and ip > 0
+                    and (vp - v_mean) / vp >= th.v_drop_frac and abs(i_mean - ip) / ip <= th.i_stable_frac):
+                add("bypass_diode", "FAULT", "Sudden voltage drop at steady current",
+                    {"v_before": vp, "v_now": v_mean, "drop": (vp - v_mean) / vp}, loss=loss)
+
+    rel = pr_win / pr_ref if pr_ref else 1.0
+    if rel < th.shading_rel and not any(f.severity == "FAULT" for f in findings):
+        slot = slot_of(statistics.fmean(s.ts for s in lit), cfg)
+        days = [d for d in history[-th.shading_days_lookback:] if slot in d.slots_rel]
+        hits = sum(1 for d in days if d.slots_rel[slot] < th.shading_rel)
+        if hits >= th.shading_min_days:
+            add("shading_recurring", "WARNING", f"Recurring shading around {slot // 60:02d}:{slot % 60:02d}",
+                {"days_with_dip": float(hits), "relative_pr": rel}, loss=max(0.0, 1.0 - rel))
+        else:
+            add("shading_transient", "INFO", "Short dip in output", {"relative_pr": rel, "days_with_dip_so_far": float(hits)})
+
+    series = [d.pr_day for d in history if d.pr_day]
+    if len(series) >= th.soiling_min_days:
+        start = 0
+        for k in range(1, len(series)):
+            if series[k] - series[k - 1] >= th.reset_jump:
+                start = k
+        seg = series[start:]
+        if len(seg) >= th.soiling_min_days:
+            slope, drop = _lstsq_slope(seg), seg[0] - seg[-1]
+            last_rel = list(history[-1].slots_rel.values())
+            flat = (statistics.pstdev(last_rel) if len(last_rel) > 2 else 0.0) <= th.soiling_flat_std
+            if slope <= th.soiling_slope and drop >= th.soiling_drop and flat:
+                ref = max(series)
+                lf = max(0.0, 1.0 - seg[-1] / ref)
+                daily = _daily_expected_kwh(history, cfg)
+                be = cleaning_breakeven_days(cfg.cleaning_cost_amd, lf * daily, cfg.tariff_day)
+                ev = {"pr_slope_per_day": slope, "pr_drop": drop, "loss_fraction": lf}
+                if be is not None:
+                    ev["cleaning_breakeven_days"] = be
+                    ev["clean_now"] = 1.0 if be <= th.clean_horizon_days else 0.0
+                add("soiling", "WARNING", "Gradual loss consistent with dust/soiling", ev, loss=lf)
+    if detect_fix(history, th):
+        add("soiling_cleared", "INFO", "Output recovered (cleaning or rain)", {"pr_jump": history[-1].pr_day - history[-2].pr_day})
+
+    if t_cell >= th.heat_t_cell and pr_win < th.ok_pr - th.heat_gap and not findings:
+        add("heat_derating", "INFO", "Output reduced by high panel temperature", {"t_cell": t_cell, "pr": pr_win}, loss=loss)
+
+    if not any(f.severity in ("WARNING", "FAULT") for f in findings) and pr_win < th.warn_pr and not any(f.code == "heat_derating" for f in findings):
+        add("unexplained", "WARNING", "Underperforming without a clear cause", {"pr": pr_win}, loss=loss)
+
+    worst = max((f.severity for f in findings), key=lambda s: SEVERITY_ORDER[s], default=None)
+    status = "OK" if worst is None else {"INFO": "INFO", "WARNING": "WARNING", "FAULT": "FAULT"}[worst]
+    if status == "INFO" and pr_win >= th.ok_pr:
+        status = "OK"
+    return Diagnosis(status, findings, pr_win, g_mean, t_cell)
+
+
+
+"""battery and load controller"""
+
+@dataclass
+class Battery:
+    capacity_wh: float
+    soc: float = 0.5
+    soc_min: float = 0.10
+    soc_max: float = 0.95
+    max_charge_w: float = 3000.0
+    max_discharge_w: float = 3000.0
+    eta_c: float = 0.95
+    eta_d: float = 0.95            
+
+    @property
+    def stored_wh(self) -> float:
+        return self.soc * self.capacity_wh
+
+
+@dataclass
+class Load:
+    name: str
+    power_w: float
+    priority: int                  
+    demand_wh_per_day: float
+    min_on_s: float = 120.0
+    min_off_s: float = 120.0
+    defer_to_night: bool = False   
+
+
+@dataclass
+class _LoadState:
+    on: bool = False
+    last_change: float = -1e12
+    wh_today: float = 0.0
+
+
+@dataclass
+class StepResult:
+    ts: float
+    dt_s: float
+    pv_w: float
+    base_w: float
+    load_w: float
+    batt_w: float                  
+    grid_w: float                  
+    soc: float
+    relays: Dict[str, bool]
+    solar_to_loads_w: float
+    night_load_w: float
+    actions: List[str]
+
+
+class Controller:
+    def __init__(self, cfg: SiteConfig, loads: Sequence[Load], battery: Optional[Battery] = None):
+        self.cfg, self.loads, self.battery = cfg, list(loads), battery
+        self.state = {l.name: _LoadState() for l in loads}
+        self._day: Optional[str] = None
+
+    def relays(self) -> Dict[str, bool]:
+        return {n: s.on for n, s in self.state.items()}
+
+    def step(self, ts: float, pv_w: float, base_w: float, dt_s: float) -> StepResult:
+        cfg, b = self.cfg, self.battery
+        day = local_dt(ts, cfg).strftime("%Y-%m-%d")
+        if day != self._day:
+            for s in self.state.values():
+                s.wh_today = 0.0
+            self._day = day
+        actions: List[str] = []
+        dt_h = dt_s / 3600.0
+        night = not is_day(ts, cfg)
+
+        surplus = pv_w - base_w
+        charge_w = 0.0
+        if b and surplus > 0 and b.soc < b.soc_max:
+            headroom_w = (b.soc_max - b.soc) * b.capacity_wh / (b.eta_c * dt_h)
+            charge_w = min(surplus, b.max_charge_w, headroom_w)
+        remaining = surplus - charge_w
+
+        solar_to_loads = night_w = load_w = 0.0
+        for l in sorted(self.loads, key=lambda x: x.priority):
+            st = self.state[l.name]
+            satisfied = st.wh_today >= l.demand_wh_per_day
+            want, reason, from_solar = False, "", False
+            if satisfied:
+                reason = "daily demand satisfied"
+            elif remaining >= l.power_w * (0.7 if st.on else 1.0):
+                want, reason, from_solar = True, "solar surplus", True
+            elif l.defer_to_night and night:
+                want, reason = True, "night tariff window"
+            if want != st.on:
+                held = ts - st.last_change < (l.min_on_s if st.on else l.min_off_s)
+                if held and not (satisfied and st.on):
+                    want, reason = st.on, "hold (min on/off time)"
+            if want != st.on:
+                st.on, st.last_change = want, ts
+                actions.append(f"{l.name} {'ON' if want else 'OFF'}: {reason}")
+            if st.on:
+                load_w += l.power_w
+                st.wh_today += l.power_w * dt_h
+                if from_solar or (remaining > 0 and not night):
+                    take = min(l.power_w, max(remaining, 0.0))
+                    remaining -= take
+                    solar_to_loads += take
+                elif night:
+                    night_w += l.power_w
+
+        net = pv_w - base_w - load_w - charge_w          
+        discharge_w = 0.0
+        if net < 0 and b and b.soc > b.soc_min:
+            avail_w = (b.soc - b.soc_min) * b.capacity_wh * b.eta_d / dt_h
+            discharge_w = min(-net, b.max_discharge_w, avail_w)
+            if discharge_w > 0 and not any("battery" in a for a in actions):
+                pass
+        grid_w = -net - discharge_w                      
+        batt_w = charge_w - discharge_w
+        if b:
+            b.soc += charge_w * b.eta_c * dt_h / b.capacity_wh
+            b.soc -= discharge_w * dt_h / (b.eta_d * b.capacity_wh)
+            b.soc = min(max(b.soc, 0.0), 1.0)
+        return StepResult(ts, dt_s, pv_w, base_w, load_w, batt_w, grid_w, b.soc if b else 0.0, self.relays(),
+                          solar_to_loads, night_w, actions)
+
+
+
+"""ledger"""
+
+class Ledger:
+    def __init__(self, cfg: SiteConfig, battery_capacity_wh: float = 0.0, fault_pr: float = 0.92):
+        self.cfg, self.cap, self.fault_pr = cfg, battery_capacity_wh, fault_pr
+        self.rows: List[dict] = []
+        self.fixes: List[Tuple[float, str, float]] = []
+        self.actions: List[Tuple[float, str]] = []
+
+    def add(self, step: StepResult, sample: Optional[Sample] = None) -> None:
+        k = self.cfg.site_scale
+        pe = sample.p_exp * k if sample and sample.valid else 0.0
+        pr = sample.pr if sample and sample.valid else None
+        self.rows.append(dict(ts=step.ts, dt=step.dt_s, pv=step.pv_w, base=step.base_w, loads=step.load_w,
+                              batt=step.batt_w, grid=step.grid_w, soc=step.soc, p_exp=pe, pr=pr,
+                              s2l=step.solar_to_loads_w, night=step.night_load_w))
+        self.actions.extend((step.ts, a) for a in step.actions)
+
+    def _loss_fraction(self, rows: Sequence[dict]) -> float:
+        num = sum(max(0.0, r["p_exp"] - r["pv"]) * r["dt"] for r in rows if r["pr"] is not None and r["pr"] < self.fault_pr)
+        den = sum(r["p_exp"] * r["dt"] for r in rows if r["pr"] is not None)
+        return num / den if den > 0 else 0.0
+
+    def mark_fix(self, ts: float, code: str, lookback_h: float = 72.0) -> float:
+        """Record that a problem was fixed at `ts`; recovery is measured against the loss rate before it."""
+        before = [r for r in self.rows if ts - lookback_h * 3600 <= r["ts"] < ts]
+        base = self._loss_fraction(before)
+        self.fixes.append((ts, code, base))
+        self.actions.append((ts, f"fix recorded: {code} (loss before fix {base:.1%})"))
+        return base
+
+    def summary(self, sunsync_cost_amd: float = 0.0, solar_system_cost_amd: float = 0.0) -> dict:
+        cfg, ep = self.cfg, export_price(self.cfg)
+        pv = cons = baseline = actual = lost = lost_amd = rec = rec_amd = shift = night = batt_dis = batt_chg = 0.0
+        for r in self.rows:
+            h, t = r["dt"] / 3600.0, tariff_at(r["ts"], cfg)
+            c_wh = (r["base"] + r["loads"]) * h
+            imp, exp = max(r["grid"], 0.0) * h, max(-r["grid"], 0.0) * h
+            pv += r["pv"] * h
+            cons += c_wh
+            baseline += c_wh / 1000 * t
+            actual += imp / 1000 * t - exp / 1000 * ep
+            shift += r["s2l"] * h / 1000 * cfg.tariff_day * (1 - cfg.export_fraction)
+            night += r["night"] * h / 1000 * (cfg.tariff_day - cfg.tariff_night)
+            batt_dis += max(-r["batt"], 0.0) * h / 1000 * t
+            batt_chg += max(r["batt"], 0.0) * h / 1000
+            if r["pr"] is not None and r["pr"] < self.fault_pr:
+                shortfall = max(0.0, r["p_exp"] - r["pv"]) * h
+                lost += shortfall
+                lost_amd += shortfall / 1000 * t
+            if r["pr"] is not None and self.fixes:
+                prior = [f for f in self.fixes if f[0] <= r["ts"]]
+                if prior:
+                    base_loss = prior[-1][2]
+                    gain_frac = max(0.0, base_loss - max(0.0, 1.0 - r["pr"]))
+                    wh = r["p_exp"] * h * gain_frac
+                    rec += wh
+                    rec_amd += wh / 1000 * t
+        d_stored = (self.rows[-1]["soc"] - self.rows[0]["soc"]) * self.cap / 1000 if self.rows and self.cap else 0.0
+        batt_value = batt_dis - max(0.0, batt_chg - d_stored) * ep
+        sunsync_value = rec_amd + shift + night + batt_value
+        days = (self.rows[-1]["ts"] - self.rows[0]["ts"]) / 86400 if len(self.rows) > 1 else 0.0
+        out = dict(days=days, pv_kwh=pv / 1000, consumption_kwh=cons / 1000,
+                   bill_savings_amd=baseline - actual, money_lost_to_faults_amd=lost_amd, lost_kwh=lost / 1000,
+                   recovered_kwh=rec / 1000, recovered_amd=rec_amd, shifting_value_amd=shift,
+                   night_shift_value_amd=night, battery_value_amd=batt_value, sunsync_value_amd=sunsync_value,
+                   co2_avoided_kg=pv / 1000 * cfg.emission_factor_t_per_mwh,
+                   actions_logged=len(self.actions), fixes=len(self.fixes))
+        if days > 0:
+            out["sunsync_value_per_year_amd"] = sunsync_value * 365 / days
+            out["bill_savings_per_year_amd"] = (baseline - actual) * 365 / days
+        if sunsync_cost_amd > 0:
+            out["sunsync_net_amd"] = sunsync_value - sunsync_cost_amd
+            out["sunsync_roi"] = (sunsync_value - sunsync_cost_amd) / sunsync_cost_amd
+        if solar_system_cost_amd > 0 and days > 0:
+            out["solar_payback_years"] = solar_system_cost_amd / out["bill_savings_per_year_amd"] if out["bill_savings_per_year_amd"] > 0 else None
+        return out
