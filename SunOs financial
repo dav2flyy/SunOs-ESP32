@@ -1,0 +1,367 @@
+"""SunSync financial"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, replace
+from statistics import NormalDist
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
+
+MONTH_SHARE = (0.040, 0.055, 0.080, 0.098, 0.112, 0.122, 0.130, 0.120, 0.100, 0.075, 0.045, 0.023)
+
+@dataclass(frozen=True)
+class Segment:
+    name: str
+    kw: float
+    shifted_share: float
+    night_shifted_kwh: float
+    hw_units: int           
+    hw_unit_price: float    
+    install_fee: float      
+    attach_rate: float      
+    cac: float              
+    min_sub: float          
+
+HOME = Segment("home", kw=9, shifted_share=0.10, night_shifted_kwh=0, hw_units=1,
+               hw_unit_price=40, install_fee=0, attach_rate=0.5, cac=20, min_sub=40)
+SME = Segment("sme", kw=49, shifted_share=0.03, night_shifted_kwh=0, hw_units=2,
+              hw_unit_price=120, install_fee=60, attach_rate=1.0, cac=150, min_sub=40)
+
+@dataclass(frozen=True)
+class Params:
+    """macro"""
+    fx: float = 362.55
+    tariff_day: float = 44.98
+    tariff_night: float = 34.98
+    export_fraction: float = 0.60
+    """yield"""
+    yield_kwh_per_kw: float = 1550.0
+    month_share: Tuple[float, ...] = MONTH_SHARE
+    degradation: float = 0.005      
+    loss_recovered: float = 0.05    
+    """pricing segments"""
+    price_per_kw: float = 4.0
+    home: Segment = HOME
+    sme: Segment = SME
+    """battery (0 = none)"""
+    battery_kwh: float = 0.0
+    battery_dod: float = 0.9
+    battery_rte: float = 0.9
+    battery_cycles: float = 300.0
+    battery_degradation: float = 0.02
+    battery_cost_usd_per_kwh: float = 300.0
+    battery_optimizer_share: float = 0.20  
+    """company"""
+    end_home: Tuple[int, ...] = (150, 600, 1500, 3000, 5000)
+    end_sme: Tuple[int, ...] = (30, 100, 250, 450, 700)
+    customer_scale: float = 1.0
+    hw_cogs_share: float = 0.65
+    cloud_per_site: float = 12.0
+    support_per_site: float = 8.0
+    include_salaries: bool = True
+    fte_years: Tuple[float, ...] = (1.5, 3.0, 4.5, 6.0, 8.0)
+    monthly_salary: float = 1800.0
+    salary_growth: float = 0.0
+    overhead: Tuple[float, ...] = (3000, 6000, 10000, 14000, 18000)
+    opex_override: Optional[Tuple[float, ...]] = None   
+    """market"""
+    sites_total: int = 50000
+    home_site_share: float = 0.90
+    installed_mw: float = 650.0
+    sam_share: float = 0.40      
+    """impact"""
+    emission_factor_t_per_mwh: float = 0.436
+
+"""helpers"""
+def sub_price(p: Params, seg: Segment) -> float:
+    """Annual subscription in USD: $/kW/yr x size, with a floor."""
+    return max(seg.min_sub, p.price_per_kw * seg.kw)
+
+def shifting_gain_amd(p: Params) -> float:
+    """AMD gained per kWh moved from exported (valued at export price) to self-used (valued at retail)."""
+    return p.tariff_day * (1.0 - p.export_fraction)
+
+def hw_oneoff_usd(seg: Segment) -> float:
+    """What the customer pays up-front (hardware + installer fee)."""
+    return seg.hw_units * seg.hw_unit_price + seg.install_fee
+
+"""battery"""
+def battery_gross_value_usd(p: Params, year: int) -> float:
+    if p.battery_kwh <= 0:
+        return 0.0
+    usable_kwh = p.battery_kwh * p.battery_dod * (1 - p.battery_degradation) ** (year - 1)
+    per_kwh_amd = p.battery_rte * p.tariff_day - p.export_fraction * p.tariff_day
+    return max(0.0, usable_kwh * p.battery_cycles * per_kwh_amd / p.fx)
+
+def battery_standalone_payback_years(p: Params) -> Optional[float]:
+    """Context only: payback of the battery itself (not of SunSync)."""
+    if p.battery_kwh <= 0:
+        return None
+    v = battery_gross_value_usd(p, 1)
+    return (p.battery_kwh * p.battery_cost_usd_per_kwh) / v if v > 0 else None
+
+"""customer layer"""
+def benefit_parts(p: Params, seg: Segment, year: int, monitoring_only: bool = False) -> Dict[str, float]:
+    prod = seg.kw * p.yield_kwh_per_kw * (1 - p.degradation) ** (year - 1)
+    monitoring = prod * p.loss_recovered * p.tariff_day / p.fx
+    if monitoring_only:
+        return dict(production_kwh=prod, monitoring=monitoring, shifting=0.0, night=0.0, battery=0.0, total=monitoring)
+    shifting = prod * seg.shifted_share * shifting_gain_amd(p) / p.fx
+    night = seg.night_shifted_kwh * (p.tariff_day - p.tariff_night) / p.fx
+    battery = p.battery_optimizer_share * battery_gross_value_usd(p, year)
+    return dict(production_kwh=prod, monitoring=monitoring, shifting=shifting, night=night,
+                battery=battery, total=monitoring + shifting + night + battery)
+
+def payback_months(p: Params, seg: Segment, start_month: int = 0, monitoring_only: bool = False,
+                   horizon_years: int = 10) -> Optional[float]:
+    share = [s / sum(p.month_share) for s in p.month_share]
+    cum = -hw_oneoff_usd(seg)
+    sub_m = sub_price(p, seg) / 12.0
+    for m in range(horizon_years * 12):
+        year = m // 12 + 1
+        b = benefit_parts(p, seg, year, monitoring_only)["total"] * share[(start_month + m) % 12]
+        prev, cum = cum, cum + b - sub_m
+        if cum >= 0:
+            return m + (-prev) / (cum - prev)
+    return None
+
+def customer_roi(p: Params, seg: Segment, monitoring_only: bool = False,
+                 years: Sequence[int] = (1, 3, 5), start_month: int = 0) -> Dict:
+    ben = [benefit_parts(p, seg, y, monitoring_only) for y in range(1, max(years) + 1)]
+    y1 = ben[0]["total"]
+    sub, hw = sub_price(p, seg), hw_oneoff_usd(seg)
+    out: Dict = dict(segment=seg.name, parts_y1=ben[0], benefit_y1=y1, sub=sub, hw_oneoff=hw,
+                     payback_simple_months=(hw + sub) / y1 * 12 if y1 > 0 else None,
+                     payback_months=payback_months(p, seg, start_month, monitoring_only))
+    sweep = [payback_months(p, seg, s, monitoring_only) for s in range(12)]
+    valid = [x for x in sweep if x is not None]
+    out["payback_best_worst"] = (min(valid), max(valid)) if valid else (None, None)
+    out["cost"], out["benefit"], out["roi"] = {}, {}, {}
+    for n in years:
+        cost = hw + sub * n
+        gain = sum(b["total"] for b in ben[:n])
+        out["cost"][n], out["benefit"][n], out["roi"][n] = cost, gain, (gain - cost) / cost
+    return out
+
+def breakeven_loss_recovered(p: Params, seg: Segment, years: int = 1, monitoring_only: bool = True) -> float:
+    def total(loss: float) -> float:
+        q = replace(p, loss_recovered=loss)
+        return sum(benefit_parts(q, seg, y, monitoring_only)["total"] for y in range(1, years + 1))
+    a, b = total(0.0), total(1.0) - total(0.0)
+    cost = hw_oneoff_usd(seg) + sub_price(p, seg) * years
+    return (cost - a) / b
+
+"""company layer"""
+def company_model(p: Params) -> Dict:
+    s = p.customer_scale
+    end_h = [round(x * s) for x in p.end_home]
+    end_s = [round(x * s) for x in p.end_sme]
+    h, m = p.home, p.sme
+    rows, cum_rev, cum_cost = [], 0.0, 0.0
+    prev_h = prev_s = 0
+    for i in range(len(end_h)):
+        avg_h, avg_s = (prev_h + end_h[i]) / 2, (prev_s + end_s[i]) / 2
+        new_h, new_s = end_h[i] - prev_h, end_s[i] - prev_s
+        sw = avg_h * sub_price(p, h) + avg_s * sub_price(p, m)
+        hw = (new_h * h.attach_rate * h.hw_units * h.hw_unit_price
+              + new_s * m.attach_rate * m.hw_units * m.hw_unit_price)
+        revenue = sw + hw
+        cogs = hw * p.hw_cogs_share
+        cloud = (avg_h + avg_s) * (p.cloud_per_site + p.support_per_site)
+        cac = new_h * h.cac + new_s * m.cac
+        salaries = p.fte_years[i] * 12 * p.monthly_salary * (1 + p.salary_growth) ** i if p.include_salaries else 0.0
+        if p.include_salaries and p.opex_override is not None:
+            opex, salaries_used = p.opex_override[i], None
+        else:
+            opex, salaries_used = salaries + p.overhead[i], salaries
+        costs = cogs + cloud + cac + opex
+        profit = revenue - costs
+        cum_rev += revenue
+        cum_cost += costs
+        rows.append(dict(year=i + 1, end_home=end_h[i], end_sme=end_s[i], software=sw, hardware=hw, revenue=revenue,
+                         cogs=cogs, cloud=cloud, cac=cac, salaries=salaries_used, opex=opex, costs=costs,
+                         profit=profit, cum_rev=cum_rev, cum_cost=cum_cost, cum_net=cum_rev - cum_cost,
+                         roi=(cum_rev - cum_cost) / cum_cost))
+        prev_h, prev_s = end_h[i], end_s[i]
+    nets = [r["cum_net"] for r in rows]
+    breakeven = None
+    for i, v in enumerate(nets):
+        if v >= 0:
+            prev = nets[i - 1] if i else 0.0
+            breakeven = i + (-prev / (v - prev) if v != prev and prev < 0 else 0.0)
+            break
+    return dict(rows=rows, peak_funding=max(0.0, -min(nets)), breakeven_year=breakeven)
+
+"""market layer"""
+def market(p: Params) -> Dict:
+    homes = round(p.sites_total * p.home_site_share)
+    smes = p.sites_total - homes
+    h, m = p.home, p.sme
+    bottom_up = homes * sub_price(p, h) + smes * sub_price(p, m)
+    top_down = p.installed_mw * 1000 * p.price_per_kw
+    hardware = homes * h.attach_rate * h.hw_units * h.hw_unit_price + smes * m.attach_rate * m.hw_units * m.hw_unit_price
+    kwh = p.installed_mw * 1000 * p.yield_kwh_per_kw
+    value_at_stake = kwh * p.loss_recovered * p.tariff_day / p.fx
+    y5_software = company_model(p)["rows"][-1]["software"] if len(p.end_home) >= 5 else None
+    return dict(homes=homes, smes=smes,
+                capacity_check_mw=(homes * h.kw + smes * m.kw) / 1000,
+                recurring_bottom_up=bottom_up, recurring_top_down=top_down, hardware_pool=hardware,
+                annual_gwh=kwh / 1e6, value_at_stake=value_at_stake,
+                price_share_of_value=bottom_up / value_at_stake,
+                sam=bottom_up * p.sam_share,
+                growth_y5={g: bottom_up * (1 + g) ** 5 for g in (0.0, 0.25, 0.5)},
+                som_share_today=(y5_software / bottom_up) if y5_software else None)
+
+def impact(p: Params, n_home: int, n_sme: int) -> Dict:
+    kwh = (n_home * p.home.kw + n_sme * p.sme.kw) * p.yield_kwh_per_kw * p.loss_recovered
+    gwh = kwh / 1e6
+    return dict(gwh=gwh, co2_tonnes=gwh * 1000 * p.emission_factor_t_per_mwh,
+                share_of_sites=(n_home + n_sme) / p.sites_total)
+
+"""scenarios and sensitivity"""
+def legacy_params(include_salaries: bool = True) -> Params:
+    home = replace(HOME, kw=10, shifted_share=1500 / 15500)
+    sme = replace(SME, kw=100)
+    return Params(fx=370, tariff_day=45, degradation=0.0, home=home, sme=sme, include_salaries=include_salaries,
+                  opex_override=(40000, 70000, 110000, 150000, 190000) if include_salaries else None)
+
+def scenarios(base: Params) -> Dict[str, Params]:
+    return {
+        "worst": replace(base, loss_recovered=0.02, export_fraction=0.90, price_per_kw=3.0, customer_scale=0.5),
+        "base": base,
+        "best": replace(base, loss_recovered=0.08, export_fraction=0.40, price_per_kw=5.0, customer_scale=1.3),
+    }
+
+def metric_home_roi3(p: Params) -> float:
+    return customer_roi(p, p.home)["roi"][3]
+
+def metric_sme_roi3(p: Params) -> float:
+    return customer_roi(p, p.sme)["roi"][3]
+
+def metric_company_cum5(p: Params) -> float:
+    return company_model(p)["rows"][-1]["cum_net"]
+
+TORNADO_FIELDS = ("loss_recovered", "export_fraction", "tariff_day", "yield_kwh_per_kw", "price_per_kw",
+                  "fx", "hw_cogs_share", "cloud_per_site", "monthly_salary", "customer_scale")
+
+def tornado(p: Params, metric: Callable[[Params], float], pct: float = 0.20,
+            fields: Sequence[str] = TORNADO_FIELDS) -> List[Tuple[str, float, float, float]]:
+    out = []
+    for f in fields:
+        v = getattr(p, f)
+        lo = metric(replace(p, **{f: v * (1 - pct)}))
+        hi = metric(replace(p, **{f: min(v * (1 + pct), 1.0) if f == "export_fraction" else v * (1 + pct)}))
+        out.append((f, lo, hi, abs(hi - lo)))
+    return sorted(out, key=lambda r: -r[3])
+
+def grid(p: Params, f1: str, v1: Sequence[float], f2: str, v2: Sequence[float],
+         metric: Callable[[Params], float]) -> List[List[float]]:
+    return [[metric(replace(p, **{f1: a, f2: b})) for b in v2] for a in v1]
+
+"""pilot design (how many sites are needed?)"""
+_T95 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228,
+        11: 2.201, 12: 2.179, 13: 2.160, 14: 2.145, 15: 2.131, 16: 2.120, 17: 2.110, 18: 2.101, 19: 2.093,
+        20: 2.086, 21: 2.080, 22: 2.074, 23: 2.069, 24: 2.064, 25: 2.060, 26: 2.056, 27: 2.052, 28: 2.048,
+        29: 2.045, 30: 2.042}
+
+def t_crit95(df: int) -> float:
+    return _T95[df] if df in _T95 else (2.0 if df <= 60 else 1.96)
+
+def margin_of_error(n: int, sd: float) -> float:
+    """95% CI half-width for a mean over n sites, given per-site standard deviation sd (same units)."""
+    return t_crit95(n - 1) * sd / math.sqrt(n)
+
+def sites_for_margin(sd: float, margin: float) -> int:
+    for n in range(2, 5000):
+        if margin_of_error(n, sd) <= margin:
+            return n
+    raise ValueError("margin too small")
+
+def sites_for_detection(effect: float, sd: float, alpha: float = 0.05, power: float = 0.80) -> int:
+    add 1-2 sites for very small n)."""
+    z = NormalDist().inv_cdf
+    return math.ceil(((z(1 - alpha) + z(power)) * sd / effect) ** 2)
+
+PILOT_SD = 0.04 
+
+
+"""report"""
+def _fmt_pb(x: Optional[float]) -> str:
+    return "never (10y)" if x is None else f"{x:.1f} mo"
+
+
+def report(p: Optional[Params] = None) -> None:
+    p = p or Params()
+    print("=" * 78 + "\nSUNSYNC MODEL (defaults; all figures are estimates)\n" + "=" * 78)
+
+    print("\n[1] CUSTOMER ECONOMICS")
+    for seg in (p.home, p.sme):
+        for mon_only in (False, True):
+            r = customer_roi(p, seg, mon_only)
+            tag = "monitoring only" if mon_only else "monitoring + shifting"
+            pb = r["payback_best_worst"]
+            print(f"  {seg.name.upper():4s} {seg.kw:>4.0f} kW | {tag:22s} | benefit y1 ${r['benefit_y1']:7,.0f} "
+                  f"| cost y1 ${r['cost'][1]:6,.0f} | ROI 1/3/5y {r['roi'][1]:+.0%} / {r['roi'][3]:+.0%} / {r['roi'][5]:+.0%}"
+                  f" | payback simple {_fmt_pb(r['payback_simple_months'])}, seasonal {_fmt_pb(r['payback_months'])}"
+                  f" (start-month range {_fmt_pb(pb[0])}..{_fmt_pb(pb[1])})")
+    for seg in (p.home, p.sme):
+        print(f"  break-even recovery (monitoring only, 1y / 3y) {seg.name}: "
+              f"{breakeven_loss_recovered(p, seg, 1):.1%} / {breakeven_loss_recovered(p, seg, 3):.1%}  (assumed {p.loss_recovered:.1%})")
+    q = replace(p, battery_kwh=5.0)
+    pb_b = battery_standalone_payback_years(q)
+    print(f"  with a 5 kWh battery: home benefit y1 ${customer_roi(q, q.home)['benefit_y1']:,.0f} "
+          f"(battery gross value ${battery_gross_value_usd(q, 1):,.0f}/yr, {p.battery_optimizer_share:.0%} attributed to SunSync; "
+          f"battery's own payback {pb_b:.1f} yr)")
+
+    print("\n[2] COMPANY (5 years)")
+    for sal in (True, False):
+        c = company_model(replace(p, include_salaries=sal))
+        print(f"  {'WITH salaries' if sal else 'NO salaries  '}: peak funding ${c['peak_funding']:,.0f}, "
+              f"cumulative breakeven year {c['breakeven_year'] if c['breakeven_year'] is None else round(c['breakeven_year'], 1)}")
+        print("    yr  home/sme   revenue     costs    profit   cum_net  cumROI")
+        for r in c["rows"]:
+            print(f"    {r['year']}  {r['end_home']:>5}/{r['end_sme']:<4} {r['revenue']:9,.0f} {r['costs']:9,.0f} "
+                  f"{r['profit']:9,.0f} {r['cum_net']:9,.0f} {r['roi']:+7.1%}")
+
+    print("\n[3] MARKET")
+    mk = market(p)
+    print(f"  sites {p.sites_total:,} ({mk['homes']:,} home / {mk['smes']:,} SME), capacity check {mk['capacity_check_mw']:.0f} MW (target {p.installed_mw:.0f})")
+    print(f"  recurring pool: bottom-up ${mk['recurring_bottom_up']/1e6:.2f}M/yr | top-down (${p.price_per_kw:g}/kW x MW) ${mk['recurring_top_down']/1e6:.2f}M/yr")
+    print(f"  one-off hardware pool ${mk['hardware_pool']/1e6:.2f}M | value at stake ${mk['value_at_stake']/1e6:.2f}M/yr "
+          f"(price takes {mk['price_share_of_value']:.0%}) | SAM ${mk['sam']/1e6:.2f}M/yr")
+    print("  year-5 pool at growth 0/25/50%/yr: " + " / ".join(f"${v/1e6:.1f}M" for v in mk["growth_y5"].values()))
+    if mk["som_share_today"]:
+        print(f"  year-5 software revenue = {mk['som_share_today']:.0%} of today's pool")
+
+    print("\n[4] IMPACT (year-5 customers)")
+    last = company_model(p)["rows"][-1]
+    im = impact(p, last["end_home"], last["end_sme"])
+    print(f"  {im['gwh']:.1f} GWh/yr recovered | {im['co2_tonnes']:,.0f} t CO2/yr at {p.emission_factor_t_per_mwh} t/MWh "
+          f"| {im['share_of_sites']:.1%} of sites")
+
+    print("\n[5] SCENARIOS (company cumulative net after 5y, with salaries / no salaries; home 3y ROI)")
+    for name, q in scenarios(p).items():
+        a = company_model(q)["rows"][-1]["cum_net"]
+        b = company_model(replace(q, include_salaries=False))["rows"][-1]["cum_net"]
+        print(f"  {name:5s}: ${a:>10,.0f} / ${b:>10,.0f} | home 3y ROI {metric_home_roi3(q):+.0%} | SME 3y ROI {metric_sme_roi3(q):+.0%}")
+
+    print("\n[6] SENSITIVITY: +/-20% one at a time")
+    for title, metric, fmt in (("home 3y ROI", metric_home_roi3, "{:+.0%}"),
+                               ("company cum. net y5 (salaried)", metric_company_cum5, "${:,.0f}")):
+        print(f"  {title}")
+        for f, lo, hi, _ in tornado(p, metric)[:6]:
+            print(f"    {f:18s} -20%: {fmt.format(lo):>10s}   +20%: {fmt.format(hi):>10s}")
+    print("  home 3y ROI grid: rows loss_recovered 2/3.5/5/6.5/8%, cols export_fraction 0.4/0.6/0.8/1.0")
+    for lr, row in zip((0.02, 0.035, 0.05, 0.065, 0.08), grid(p, "loss_recovered", (0.02, 0.035, 0.05, 0.065, 0.08),
+                                                              "export_fraction", (0.4, 0.6, 0.8, 1.0), metric_home_roi3)):
+        print(f"    {lr:5.1%}: " + "  ".join(f"{v:+7.0%}" for v in row))
+
+    print(f"\n[7] PILOT DESIGN (per-site sd of recovery = {PILOT_SD:.0%}, ASSUMPTION)")
+    for n in (10, 15, 20, 30):
+        print(f"  {n:>2} sites -> 95% margin of error +/-{margin_of_error(n, PILOT_SD)*100:.1f} pp")
+    print(f"  sites for +/-1.5 pp margin: {sites_for_margin(PILOT_SD, 0.015)}   for +/-2 pp: {sites_for_margin(PILOT_SD, 0.02)}")
+    print(f"  sites to detect true 5% vs a 2.4% threshold (80% power, one-sided 5%): {sites_for_detection(0.05 - 0.024, PILOT_SD)}")
+
+
+if __name__ == "__main__":
+    report()
