@@ -1,0 +1,147 @@
+import argparse
+import json
+import math
+import random
+import urllib.request
+from datetime import datetime, timedelta, timezone
+
+from sunsync_core import (AlertTracker, Battery, Controller, Ledger, Load, SiteConfig, Thresholds, calibrate_k, detect_fix,
+                          diagnose, local_dt, make_sample, reference_pr, summarize_day)
+
+TZ = timezone(timedelta(hours=4))
+START = datetime(2026, 10, 5, 0, 0, tzinfo=TZ)
+K_TRUE = 0.95            
+
+
+def solar_g(minute: int, day: int, rng: random.Random) -> float:
+    sunrise, sunset = 7 * 60, 18 * 60
+    if not sunrise <= minute <= sunset:
+        return 0.0
+    x = math.sin(math.pi * (minute - sunrise) / (sunset - sunrise))
+    g = 880.0 * x ** 1.2
+    if day == 6:   # passing clouds
+        g *= 0.35 + 0.65 * (0.5 + 0.5 * math.sin(minute / 9.0)) ** 2
+    return max(0.0, g * (1 + rng.gauss(0, 0.01)))
+
+
+def panel(g: float, t_amb: float, minute: int, day: int, cfg: SiteConfig, rng: random.Random):
+    t_back = t_amb + 25.0 * g / 1000.0
+    t_cell = t_back + cfg.cell_dt_at_1000 * g / 1000.0
+    p_h = cfg.p_rated_w * (g / 1000) * (1 + cfg.gamma_p * (t_cell - 25)) * K_TRUE
+    v_h = cfg.v_mp * (1 - 0.0035 * (t_cell - 25)) * (0.93 + 0.07 * min(1.0, g / 1000)) if g > 5 else 0.0
+    soil = 0.012 * (min(day, 8) - 2) if 3 <= day <= 8 else 0.0
+    shade = 0.60 if (day >= 4 and 13 * 60 + 30 <= minute < 14 * 60 + 15) else 1.0
+    p = p_h * (1 - soil) * shade
+    i = p / v_h if v_h > 0 else 0.0
+    v = v_h
+    if day == 11 and 10 * 60 <= minute < 11 * 60:
+        v *= 0.67                                  
+    if day == 11 and 15 * 60 <= minute < 15 * 60 + 30:
+        i *= 0.01                                  
+    v *= 1 + rng.gauss(0, 0.004)
+    i *= 1 + rng.gauss(0, 0.006)
+    return v, max(0.0, i), t_back
+
+def house_base_w(minute: int) -> float:
+    h = minute / 60
+    return 350 + (500 if 7 <= h < 9 else 0) + (1100 if 18 <= h < 23 else 0)
+
+def run(days: int = 12, seed: int = 1, post: str = "", scale: float = 500.0, verbose: bool = True) -> dict:
+    rng = random.Random(seed)
+    cfg = SiteConfig(site_scale=scale)
+    th = Thresholds()
+    loads = [Load("boiler", 2000, 1, 3000, defer_to_night=True), Load("pump", 750, 2, 1500),
+             Load("ev_charger", 3000, 3, 6000)]
+    ctrl = Controller(cfg, loads, Battery(capacity_wh=5000, soc=0.3))
+    ledger = Ledger(cfg, battery_capacity_wh=5000)
+    history, events, calibrated = [], {}, False
+    tracker, alerts = AlertTracker(), []
+    all_samples = []
+
+    def log_event(code, ts, text):
+        events.setdefault(code, []).append((ts, text))
+
+    for d in range(days):
+        day_samples, win, prev = [], [], []
+        for minute in range(0, 1440):
+            ts = (START + timedelta(days=d, minutes=minute)).timestamp()
+            t_amb = 12 + 9 * math.sin(math.pi * (minute - 6 * 60) / (12 * 60)) if 6 * 60 <= minute <= 18 * 60 else 9.0
+            g = solar_g(minute, d, rng)
+            v, i, t_back = panel(g, t_amb, minute, d, cfg, rng)
+            lux = g * cfg.lux_per_wm2 * (1 + rng.gauss(0, 0.02))
+            raw = dict(ts=ts, v=round(v, 3), i=round(i, 4), temp_c=round(t_back, 2), lux=round(lux, 1), flags=0)
+            if d == 7 and 12 * 60 <= minute < 12 * 60 + 5:
+                raw["lux"], raw["flags"] = None, 0x02             
+            s = make_sample(raw, cfg)
+            day_samples.append(s)
+            all_samples.append(s)
+            if post:
+                try:
+                    req = urllib.request.Request(post, data=json.dumps(dict(raw, device_id="sim")).encode(),
+                                                 headers={"Content-Type": "application/json"})
+                    urllib.request.urlopen(req, timeout=2).read()
+                except Exception as e:      
+                    print("post failed:", e)
+                    post = ""
+            if d == 9 and minute == 8 * 60:
+                ledger.mark_fix(ts, "soiling")
+            pv = s.p * scale if s.valid else 0.0
+            step = ctrl.step(ts, pv, house_base_w(minute), 60.0)
+            ledger.add(step, s)
+            win.append(s)
+            if len(win) > 15:
+                win.pop(0)
+            if minute % 15 == 0 and len(win) == 15:
+                pr_ref = reference_pr(history, day_samples)
+                dg = diagnose(win, prev, history, cfg, th, pr_ref)
+                for f in dg.findings:
+                    log_event(f.code, ts, f"day {d} {local_dt(ts, cfg):%H:%M} [{f.severity}] {f.title}"
+                                          f" | loss {f.loss_fraction:.0%} ~ {f.loss_amd_per_day:,.0f} AMD/day")
+                res = tracker.update(ts, dg)
+                for code in res["opened"]:
+                    f = next(x for x in dg.findings if x.code == code)
+                    alerts.append((ts, "OPEN ", f"{code}: {f.title} | est. loss {f.loss_fraction:.0%} (~{f.loss_amd_per_day:,.0f} AMD/day)"
+                                       + (f" | clean in {f.evidence['cleaning_breakeven_days']:.0f} days to break even" if "cleaning_breakeven_days" in f.evidence else "")))
+                for code in res["closed"]:
+                    alerts.append((ts, "CLOSED", code))
+                prev = list(win)
+            if d == 0 and minute == 14 * 60 and not calibrated:
+                cfg = SiteConfig(site_scale=scale, k_cal=calibrate_k(day_samples, cfg))
+                ctrl.cfg = ledger.cfg = cfg
+                calibrated = True
+                if verbose:
+                    print(f"calibration on day 0: k_cal = {cfg.k_cal:.3f}  (true value {K_TRUE})")
+                # re-score the samples already taken with the calibrated model
+                day_samples[:] = [make_sample(dict(ts=x.ts, v=x.v, i=x.i, temp_c=x.temp_c, lux=x.lux, flags=x.flags), cfg)
+                                  for x in day_samples]
+        ds = summarize_day(day_samples, cfg)
+        history.append(ds)
+        if detect_fix(history):
+            alerts.append((day_samples[-1].ts, "INFO  ", f"output recovered: median PR jumped to {ds.pr_med:.3f}"))
+        if verbose:
+            print(f"day {d:2d} {ds.date} PR_day {ds.pr_day:.3f}  produced {ds.energy_wh * scale / 1000:6.2f} kWh (virtual 10 kW site)")
+
+    summary = ledger.summary()
+    if verbose:
+        print("\nALERTS (opened when first seen, closed after 3 clean windows)")
+        for ts, kind, text in alerts:
+            print(f"  {local_dt(ts, cfg):%m-%d %H:%M} {kind} {text}")
+        print("\nACTION LOG (first 8 of %d)" % len(ledger.actions))
+        for ts, a in ledger.actions[:8]:
+            print(f"  {local_dt(ts, cfg):%m-%d %H:%M}  {a}")
+        print("\nLEDGER (simulated, virtual 10 kW site)")
+        for k, v in summary.items():
+            print(f"  {k:28s} {v:,.2f}" if isinstance(v, float) else f"  {k:28s} {v}")
+        per_day = summary["sunsync_value_amd"] / max(summary["days"], 1e-9)
+        print(f"\n  SunSync-attributed value ~ {per_day:,.0f} AMD/day over this simulated run "
+              f"(not a forecast: weather, faults and loads are invented)")
+    return dict(summary=summary, events=events, alerts=alerts, history=history, ledger=ledger, cfg=cfg)
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--days", type=int, default=12)
+    ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--scale", type=float, default=500.0, help="virtual site size multiplier (500 x 20 W = 10 kW)")
+    ap.add_argument("--post", default="", help="also POST each sample to this backend URL")
+    a = ap.parse_args()
+    run(a.days, a.seed, a.post, a.scale)
