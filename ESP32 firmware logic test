@@ -1,0 +1,41 @@
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+HT = os.path.join(HERE, "firmware", "host_test")
+
+@unittest.skipUnless(shutil.which("g++"), "g++ not installed")
+class FirmwareHostTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.exe = os.path.join(tempfile.mkdtemp(), "fw_test")
+        c = subprocess.run(["g++", "-std=c++17", "-Wall", "-Wno-unused-function", "-I", os.path.join(HT, "stubs"),
+                            os.path.join(HT, "host_test.cpp"), "-o", cls.exe], capture_output=True, text=True)
+        assert c.returncode == 0, c.stderr
+        cls.run_ = subprocess.run([cls.exe], capture_output=True, text=True)
+
+    def test_all_cpp_checks_pass(self):
+        self.assertEqual(self.run_.returncode, 0, self.run_.stdout)
+        self.assertIn("ALL PASSED", self.run_.stdout)
+        self.assertNotIn("FAIL:", self.run_.stdout)
+
+    def test_firmware_json_is_valid_and_accepted_by_the_python_backend(self):
+        lines = [l[5:] for l in self.run_.stdout.splitlines() if l.startswith("JSON:")]
+        self.assertEqual(len(lines), 2)
+        first = json.loads(lines[0])
+        self.assertEqual(first["temp_c"], None)
+        self.assertEqual(first["flags"], 4)
+        import sunsync_core as c
+        s = c.make_sample(first, c.SiteConfig())
+        self.assertFalse(s.valid)
+        self.assertIn("temp_fail", s.problems)
+        allnull = json.loads(lines[1])
+        self.assertTrue(all(allnull[k] is None for k in ("v", "i", "temp_c", "lux")))
+        self.assertFalse(c.make_sample(allnull, c.SiteConfig()).valid)
+
+if __name__ == "__main__":
+    unittest.main()
