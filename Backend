@@ -1,0 +1,353 @@
+from __future__ import annotations
+
+import json
+import math
+import os
+import sqlite3
+import threading
+import time
+import urllib.error
+import urllib.request
+from collections import deque
+from dataclasses import replace
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Dict, List, Optional
+from urllib.parse import parse_qs, urlparse
+
+from sunsync_core import (AlertTracker, Battery, Controller, Ledger, Load, Sample, SiteConfig, Thresholds, calibrate_k,
+                          detect_fix, diagnose, local_dt, make_sample, reference_pr, summarize_day)
+
+ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_VERSION = "2023-06-01"
+DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+LANGS = {"en": "English", "hy": "Armenian", "ru": "Russian"}
+TRUST_DEVICE_TS = os.environ.get("SUNSYNC_TRUST_DEVICE_TS") == "1"   
+
+
+
+"""AI rules"""
+
+SYSTEM_PROMPT = (
+    "You are the voice of SunSync, a solar-panel monitor for homes and small businesses in Armenia. "
+    "You receive a JSON object with the diagnosis, savings numbers and recommended actions already computed by a rules engine. "
+    "Explain them in 3-5 short sentences for a non-expert owner, in the requested language. "
+    "Use ONLY the facts in the JSON. Do not invent causes, numbers or prices. "
+    "If a finding has cleaning_breakeven_days, say whether cleaning is worth it now (clean_now=1) or not yet. "
+    "Amounts are in Armenian dram (AMD). If status is OK, say so briefly and mention the savings."
+)
+
+def template_explanation(facts: dict) -> str:
+    f = facts.get("findings", [])
+    led = facts.get("ledger", {})
+    parts = []
+    if not f:
+        parts.append("Your panels are working normally." if facts.get("status") in ("OK", "IDLE") else "No problem has been identified.")
+    for x in f[:3]:
+        line = f"{x['title']}. {x['action']}"
+        ev = x.get("evidence", {})
+        if x.get("loss_amd_per_day"):
+            line += f" Estimated loss: about {x['loss_amd_per_day']:,.0f} AMD per day."
+        if "cleaning_breakeven_days" in ev:
+            line += (f" Cleaning pays for itself in about {ev['cleaning_breakeven_days']:.0f} days"
+                     + (" - worth doing now." if ev.get("clean_now") else " - not urgent yet."))
+        parts.append(line)
+    if led:
+        parts.append(f"So far the system has saved about {led.get('bill_savings_amd', 0):,.0f} AMD on your bill, "
+                     f"of which about {led.get('sunsync_value_amd', 0):,.0f} AMD comes from SunSync's actions.")
+    return " ".join(parts)
+
+
+def build_ai_request(facts: dict, lang: str, api_key: str, model: str) -> urllib.request.Request:
+    body = dict(model=model, max_tokens=400, system=SYSTEM_PROMPT,
+                messages=[dict(role="user", content=f"Language: {LANGS.get(lang, 'English')}\nFACTS:\n{json.dumps(facts, ensure_ascii=False)}")])
+    return urllib.request.Request(ANTHROPIC_URL, data=json.dumps(body).encode(), method="POST",
+                                  headers={"x-api-key": api_key, "anthropic-version": ANTHROPIC_VERSION,
+                                           "content-type": "application/json"})
+
+_explain_cache: Dict[tuple, tuple] = {}
+
+def explain(facts: dict, lang: str = "en", ttl_s: float = 300.0) -> dict:
+    lang = lang if lang in LANGS else "en"
+    key = (lang, json.dumps(facts.get("findings", []), sort_keys=True), facts.get("status"))
+    hit = _explain_cache.get(key)
+    if hit and time.time() - hit[0] < ttl_s:
+        return dict(hit[1], cached=True)
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    out = dict(source="template", lang="en", text=template_explanation(facts))
+    if api_key:
+        try:
+            req = build_ai_request(facts, lang, api_key, os.environ.get("SUNSYNC_MODEL", DEFAULT_MODEL))
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.loads(r.read())
+            text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
+            if text:
+                out = dict(source="claude", lang=lang, text=text)
+        except Exception as e:                      
+            out["ai_error"] = f"{type(e).__name__}: {e}"
+    _explain_cache[key] = (time.time(), out)
+    return out
+
+def cfg_from_env() -> SiteConfig:
+    e = os.environ.get
+    return SiteConfig(site_scale=float(e("SUNSYNC_SITE_SCALE", "500")), p_rated_w=float(e("SUNSYNC_P_RATED_W", "20")),
+                      lux_per_wm2=float(e("SUNSYNC_LUX_PER_WM2", "120")), k_cal=float(e("SUNSYNC_K_CAL", "1.0")))
+
+"""site state"""
+class Site:
+    DIAG_EVERY_S = 60.0
+    WINDOW_S = 900.0
+
+    def __init__(self, db_path: str, cfg: Optional[SiteConfig] = None):
+        self.lock = threading.Lock()
+        self.cfg = cfg or cfg_from_env()
+        self.th = Thresholds()
+        self.loads = [Load("boiler", 2000, 1, 3000, defer_to_night=True), Load("pump", 750, 2, 1500),
+                      Load("ev_charger", 3000, 3, 6000)]
+        self.battery = Battery(capacity_wh=5000, soc=0.3)
+        self.ctrl = Controller(self.cfg, self.loads, self.battery)
+        self.ledger = Ledger(self.cfg, battery_capacity_wh=self.battery.capacity_wh)
+        self.tracker = AlertTracker()
+        self.samples: deque = deque()
+        self.today: List[Sample] = []
+        self.day: Optional[str] = None
+        self.history: list = []
+        self.last: Optional[Sample] = None
+        self.last_dg = None
+        self.last_diag_ts = 0.0
+        self.overrides: Dict[str, Optional[bool]] = {}
+        self.base_load_w = float(os.environ.get("SUNSYNC_BASE_LOAD_W", "300"))
+        self.db = sqlite3.connect(db_path, check_same_thread=False)
+        self.db.executescript(
+            CREATE TABLE IF NOT EXISTS telemetry(ts REAL, device TEXT, v REAL, i REAL, temp REAL, lux REAL, flags INT, valid INT, pr REAL);
+            CREATE TABLE IF NOT EXISTS ledger(ts REAL, row TEXT);
+            CREATE TABLE IF NOT EXISTS actions(ts REAL, text TEXT);
+            CREATE TABLE IF NOT EXISTS fixes(ts REAL, code TEXT, base REAL);
+            CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY, value REAL);
+        )
+        self._restore()
+
+    def _restore(self) -> None:
+        row = self.db.execute("SELECT value FROM config WHERE key='k_cal'").fetchone()
+        if row:
+            self._apply_cfg(replace(self.cfg, k_cal=row[0]))
+        for ts, row in self.db.execute("SELECT ts, row FROM ledger ORDER BY ts"):
+            self.ledger.rows.append(json.loads(row))
+        if self.ledger.rows:
+            self.battery.soc = self.ledger.rows[-1]["soc"]
+        self.ledger.actions = [(ts, t) for ts, t in self.db.execute("SELECT ts, text FROM actions ORDER BY ts")]
+        self.ledger.fixes = [(ts, c, b) for ts, c, b in self.db.execute("SELECT ts, code, base FROM fixes ORDER BY ts")]
+
+    def _apply_cfg(self, cfg: SiteConfig) -> None:
+        self.cfg = self.ctrl.cfg = self.ledger.cfg = cfg
+
+    def calibrate(self) -> dict:
+        """k_cal from today's clean, clear-sky samples (G >= 600 W/m2). Do this on a CLEAN panel; it resets the PR history."""
+        with self.lock:
+            try:
+                k = calibrate_k(self.today, self.cfg)
+            except ValueError as e:
+                return dict(ok=False, error=str(e))
+            self._apply_cfg(replace(self.cfg, k_cal=k))
+            self.history, self.last_dg = [], None
+            self.db.execute("INSERT OR REPLACE INTO config VALUES ('k_cal', ?)", (k,))
+            self._log(time.time(), f"calibrated: k_cal={k:.4f}")
+            self.db.commit()
+            return dict(ok=True, k_cal=round(k, 4))
+
+    """ingest"""
+    def ingest(self, raw: dict) -> dict:
+        with self.lock:
+            now = time.time()
+            ts = float(raw.get("ts") or 0)
+            if ts < 1.6e9 or (not TRUST_DEVICE_TS and abs(ts - now) > 86400 * 2):  
+                ts = now
+            s = make_sample(raw, self.cfg, ts)
+            s.ts = ts
+            dt = 10.0 if self.last is None else min(60.0, max(1.0, ts - self.last.ts))
+            self.last = s
+
+            day = local_dt(ts, self.cfg).strftime("%Y-%m-%d")
+            if self.day and day != self.day and self.today:
+                self.history.append(summarize_day(self.today, self.cfg))
+                self.history = self.history[-30:]
+                if detect_fix(self.history):
+                    self._log(ts, "output recovered (median PR jumped)")
+                self.today = []
+            self.day = day
+            self.today.append(s)
+
+            pv = s.p * self.cfg.site_scale if s.valid else 0.0
+            base = _num(raw.get("house_w"), self.base_load_w)
+            step = self.ctrl.step(ts, pv, base, dt)
+            self.ledger.add(step, s)
+            self._persist(ts, raw, s, step)
+
+            self.samples.append(s)
+            while self.samples and self.samples[0].ts < ts - 2 * self.WINDOW_S:
+                self.samples.popleft()
+            if ts - self.last_diag_ts >= self.DIAG_EVERY_S:
+                self._diagnose(ts)
+
+            relays = [self._relay_state(l.name, step.relays[l.name]) for l in self.loads]
+            return dict(ok=True, valid=s.valid, problems=list(s.problems), pr=None if s.pr is None else round(s.pr, 4),
+                        status=self.last_dg.status if self.last_dg else "WARMUP", relays=relays,
+                        relay_order=[l.name for l in self.loads])
+
+    def _relay_state(self, name: str, auto: bool) -> int:
+        o = self.overrides.get(name)
+        return int(auto if o is None else o)
+
+    def _diagnose(self, ts: float) -> None:
+        cur = [x for x in self.samples if x.ts >= ts - self.WINDOW_S]
+        prev = [x for x in self.samples if ts - 2 * self.WINDOW_S <= x.ts < ts - self.WINDOW_S]
+        self.last_dg = diagnose(cur, prev, self.history, self.cfg, self.th, reference_pr(self.history, self.today))
+        res = self.tracker.update(ts, self.last_dg)
+        for code in res["opened"]:
+            self._log(ts, f"ALERT opened: {code}")
+        for code in res["closed"]:
+            self._log(ts, f"alert closed: {code}")
+        self.last_diag_ts = ts
+
+    def _log(self, ts: float, text: str) -> None:
+        self.ledger.actions.append((ts, text))
+        self.db.execute("INSERT INTO actions VALUES (?,?)", (ts, text))
+
+    def _persist(self, ts: float, raw: dict, s: Sample, step) -> None:
+        for a in step.actions:
+            self.db.execute("INSERT INTO actions VALUES (?,?)", (ts, a))
+        r = self.ledger.rows[-1]
+        self.db.execute("INSERT INTO ledger VALUES (?,?)", (ts, json.dumps(r)))
+        self.db.execute("INSERT INTO telemetry VALUES (?,?,?,?,?,?,?,?,?)",
+                        (ts, str(raw.get("device_id", "")), s.v if math.isfinite(s.v) else None, s.i if math.isfinite(s.i) else None,
+                         s.temp_c if math.isfinite(s.temp_c) else None, s.lux if math.isfinite(s.lux) else None,
+                         s.flags, int(s.valid), s.pr))
+        self.db.commit()
+
+    """views"""
+    def status(self) -> dict:
+        with self.lock:
+            s = self.last
+            return dict(
+                reading=None if s is None, else dict(ts=s.ts, valid=s.valid, problems=list(s.problems), v=_f(s.v), i=_f(s.i), p=round(s.p, 3),
+                                                    temp_c=_f(s.temp_c), lux=_f(s.lux), g_wm2=round(s.g, 1), p_expected=round(s.p_exp, 3),
+                                                    pr=None if s.pr is None else round(s.pr, 4)),
+                diagnosis=self.last_dg.to_dict() if self.last_dg else None,
+                active_alerts=list(self.tracker.active.values()),
+                battery=dict(soc=round(self.battery.soc, 4), capacity_wh=self.battery.capacity_wh),
+                relays={l.name: self._relay_state(l.name, self.ctrl.state[l.name].on) for l in self.loads},
+                overrides={k: v for k, v in self.overrides.items() if v is not None},
+                site_scale=self.cfg.site_scale, k_cal=self.cfg.k_cal)
+
+    def ledger_view(self) -> dict:
+        with self.lock:
+            return dict(summary=self.ledger.summary(), recent_actions=[dict(ts=t, text=a) for t, a in self.ledger.actions[-20:]])
+
+    def facts(self) -> dict:
+        with self.lock:
+            dg = self.last_dg.to_dict() if self.last_dg else dict(status="WARMUP", findings=[])
+            summ = self.ledger.summary()
+        return dict(status=dg["status"], findings=dg["findings"],
+                    ledger={k: round(v, 1) for k, v in summ.items() if isinstance(v, float) and k.endswith("_amd")})
+
+    def fix(self, code: str) -> dict:
+        with self.lock:
+            ts = time.time()
+            base = self.ledger.mark_fix(ts, code)
+            self.db.execute("INSERT INTO fixes VALUES (?,?,?)", (ts, code, base))
+            self.db.execute("INSERT INTO actions VALUES (?,?)", (ts, f"fix recorded: {code}"))
+            self.db.commit()
+            return dict(ok=True, baseline_loss=round(base, 4))
+
+    def set_override(self, load: str, mode: str) -> dict:
+        with self.lock:
+            if load not in {l.name for l in self.loads}:
+                return dict(ok=False, error="unknown load")
+            if mode not in ("on", "off", "auto"):
+                return dict(ok=False, error="mode must be on/off/auto")
+            self.overrides[load] = {"on": True, "off": False, "auto": None}[mode]
+            return dict(ok=True, load=load, mode=mode)
+
+def _num(x, default: float) -> float:
+    try:
+        f = float(x)
+        return f if math.isfinite(f) else default
+    except (TypeError, ValueError):
+        return default
+
+def _f(x: float) -> Optional[float]:
+    return round(x, 3) if isinstance(x, float) and math.isfinite(x) else None
+
+"""HTTP"""
+
+def make_handler(site: Site, token: str):
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):   # quiet
+            pass
+
+        def _send(self, code: int, obj) -> None:
+            body = json.dumps(obj, separators=(",", ":")).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _body(self) -> Optional[dict]:
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                if n > 16384:
+                    return None
+                return json.loads(self.rfile.read(n) or b"{}")
+            except Exception:
+                return None
+
+        def _authed(self) -> bool:
+            return (not token) or self.headers.get("X-Device-Token") == token
+
+        def do_GET(self):
+            u = urlparse(self.path)
+            if u.path == "/api/health":
+                return self._send(200, dict(ok=True, time=time.time()))
+            if not self._authed():
+                return self._send(401, dict(ok=False, error="bad token"))
+            if u.path == "/api/status":
+                return self._send(200, site.status())
+            if u.path == "/api/ledger":
+                return self._send(200, site.ledger_view())
+            if u.path == "/api/explain":
+                lang = (parse_qs(u.query).get("lang") or ["en"])[0]
+                return self._send(200, explain(site.facts(), lang))
+            self._send(404, dict(ok=False, error="not found"))
+
+        def do_POST(self):
+            u = urlparse(self.path)
+            if not self._authed():
+                return self._send(401, dict(ok=False, error="bad token"))
+            body = self._body()
+            if body is None or not isinstance(body, dict):
+                return self._send(400, dict(ok=False, error="invalid JSON"))
+            if u.path == "/api/telemetry":
+                return self._send(200, site.ingest(body))
+            if u.path == "/api/calibrate":
+                r = site.calibrate()
+                return self._send(200 if r["ok"] else 409, r)
+            if u.path == "/api/fix":
+                return self._send(200, site.fix(str(body.get("code", "manual"))[:40]))
+            if u.path == "/api/relay":
+                return self._send(200, site.set_override(str(body.get("load", "")), str(body.get("mode", ""))))
+            self._send(404, dict(ok=False, error="not found"))
+    return H
+
+def serve(port: int = 0, db_path: str = ":memory:", token: str = "", cfg: Optional[SiteConfig] = None):
+    site = Site(db_path, cfg)
+    srv = ThreadingHTTPServer(("0.0.0.0", port), make_handler(site, token))
+    return srv, site
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8080"))
+    srv, _ = serve(port, os.environ.get("SUNSYNC_DB", "sunsync.db"), os.environ.get("SUNSYNC_DEVICE_TOKEN", ""))
+    print(f"SunSync backend on :{port}  (AI: {'Claude API' if os.environ.get('ANTHROPIC_API_KEY') else 'template fallback - set ANTHROPIC_API_KEY'})")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
